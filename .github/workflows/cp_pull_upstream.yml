@@ -1,9 +1,10 @@
-name: Upstream Sync
+name: Upstream Sync (Full)
 
 permissions:
   contents: write
   issues: write
   actions: write
+  packages: write  # 新增：需要创建Releases的权限
 
 on:
   schedule:
@@ -12,12 +13,15 @@ on:
 
 jobs:
   sync_latest_from_upstream:
-    name: Sync latest commits from upstream repo
+    name: Sync latest commits, releases and assets from upstream repo
     runs-on: ubuntu-latest
-    if: ${{ github.event.repository.fork }}
+    if: ${{ github.event.repository.fork }}  # 修复原工作流的语法错误：双大括号即可
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # 新增：需要完整的提交历史来同步标签
 
       - name: Clean issue notice
         uses: actions-cool/issues-helper@v3
@@ -25,15 +29,109 @@ jobs:
           actions: 'close-issues'
           labels: '🚨 Sync Fail'
 
-      - name: Sync upstream changes
-        id: sync
+      - name: Sync upstream code changes
+        id: sync_code
         uses: aormsby/Fork-Sync-With-Upstream-action@v3.4
         with:
           upstream_sync_repo: auto-yui-patch/fiddler-everywhere-patch-automated
           upstream_sync_branch: main
           target_sync_branch: main
-          target_repo_token: ${{ secrets.GITHUB_TOKEN }} # automatically generated, no need to set
+          target_repo_token: ${{ secrets.GITHUB_TOKEN }}  # 修复原工作流的语法错误
           test_mode: false
+
+      - name: Sync upstream release tags
+        id: sync_tags
+        run: |
+          # 添加上游仓库作为远程仓库
+          git remote add upstream https://github.com/auto-yui-patch/fiddler-everywhere-patch-automated.git 
+          
+          # 拉取上游仓库的所有标签
+          git fetch upstream --tags
+          
+          # 推送所有标签到当前仓库
+          git push origin --tags
+        continue-on-error: true  # 标签同步失败不影响主流程
+
+      - name: Sync upstream releases and assets
+        id: sync_releases
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const upstreamRepo = 'auto-yui-patch/fiddler-everywhere-patch-automated';
+            const currentRepo = context.repo.owner + '/' + context.repo.repo;
+            
+            // 获取上游仓库的所有Releases
+            const upstreamReleases = await github.rest.repos.listReleases({
+              owner: upstreamRepo.split('/')[0],
+              repo: upstreamRepo.split('/')[1],
+              per_page: 100
+            });
+            
+            // 遍历每个Release
+            for (const upstreamRelease of upstreamReleases.data) {
+              console.log(`Processing release: ${upstreamRelease.tag_name}`);
+              
+              try {
+                // 检查当前仓库是否已存在该Release
+                const existingRelease = await github.rest.repos.getReleaseByTag({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  tag: upstreamRelease.tag_name
+                }).catch(() => null);
+                
+                if (existingRelease) {
+                  console.log(`Release ${upstreamRelease.tag_name} already exists, skipping`);
+                  continue;
+                }
+                
+                // 创建新的Release
+                const newRelease = await github.rest.repos.createRelease({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  tag_name: upstreamRelease.tag_name,
+                  name: upstreamRelease.name,
+                  body: upstreamRelease.body,
+                  draft: upstreamRelease.draft,
+                  prerelease: upstreamRelease.prerelease,
+                  target_commitish: upstreamRelease.target_commitish
+                });
+                
+                // 下载并上传所有Assets
+                for (const asset of upstreamRelease.assets) {
+                  console.log(`Processing asset: ${asset.name}`);
+                  
+                  // 下载Asset
+                  const assetResponse = await github.rest.repos.getReleaseAsset({
+                    owner: upstreamRepo.split('/')[0],
+                    repo: upstreamRepo.split('/')[1],
+                    asset_id: asset.id,
+                    headers: {
+                      accept: 'application/octet-stream'
+                    }
+                  });
+                  
+                  // 上传Asset到新Release
+                  await github.rest.repos.uploadReleaseAsset({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    release_id: newRelease.data.id,
+                    name: asset.name,
+                    data: assetResponse.data,
+                    headers: {
+                      'content-type': asset.content_type,
+                      'content-length': asset.size
+                    }
+                  });
+                }
+                
+                console.log(`Successfully synced release: ${upstreamRelease.tag_name}`);
+              } catch (error) {
+                console.error(`Failed to sync release ${upstreamRelease.tag_name}:`, error);
+                // 继续处理下一个Release，不中断整个流程
+              }
+            }
+        continue-on-error: true  # Releases同步失败不影响主流程
 
       - name: Sync check
         if: failure()
